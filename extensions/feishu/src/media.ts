@@ -1,6 +1,8 @@
+import { execFile } from "child_process";
 import fs from "fs";
 import path from "path";
 import { Readable } from "stream";
+import { promisify } from "util";
 import { withTempDownloadPath, type ClawdbotConfig } from "openclaw/plugin-sdk/feishu";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
@@ -368,6 +370,90 @@ export async function sendFileFeishu(params: {
   return toFeishuSendResult(response, receiveId);
 }
 
+const execFileAsync = promisify(execFile);
+
+/**
+ * Extract the first frame of a video buffer as a JPEG thumbnail.
+ * Returns null if ffmpeg is not installed or extraction fails.
+ */
+async function extractVideoFirstFrame(videoBuffer: Buffer): Promise<Buffer | null> {
+  try {
+    return await withTempDownloadPath({ prefix: "openclaw-feishu-video-thumb" }, async (tmpDir) => {
+      const inputPath = `${tmpDir}.mp4`;
+      const outputPath = `${tmpDir}.jpg`;
+      try {
+        await fs.promises.writeFile(inputPath, videoBuffer);
+        await execFileAsync("ffmpeg", [
+          "-y",
+          "-i",
+          inputPath,
+          "-vframes",
+          "1",
+          "-f",
+          "image2",
+          "-vcodec",
+          "mjpeg",
+          outputPath,
+        ]);
+        return await fs.promises.readFile(outputPath);
+      } finally {
+        await fs.promises.unlink(inputPath).catch(() => {});
+        await fs.promises.unlink(outputPath).catch(() => {});
+      }
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Send a video message using msg_type "media" with file_key and optional image_key thumbnail
+ */
+export async function sendVideoFeishu(params: {
+  cfg: ClawdbotConfig;
+  to: string;
+  fileKey: string;
+  imageKey?: string;
+  replyToMessageId?: string;
+  replyInThread?: boolean;
+  accountId?: string;
+}): Promise<SendMediaResult> {
+  const { cfg, to, fileKey, imageKey, replyToMessageId, replyInThread, accountId } = params;
+  const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({
+    cfg,
+    to,
+    accountId,
+  });
+  const content = JSON.stringify({
+    file_key: fileKey,
+    ...(imageKey ? { image_key: imageKey } : {}),
+  });
+
+  if (replyToMessageId) {
+    const response = await client.im.message.reply({
+      path: { message_id: replyToMessageId },
+      data: {
+        content,
+        msg_type: "media",
+        ...(replyInThread ? { reply_in_thread: true } : {}),
+      },
+    });
+    assertFeishuMessageApiSuccess(response, "Feishu video reply failed");
+    return toFeishuSendResult(response, receiveId);
+  }
+
+  const response = await client.im.message.create({
+    params: { receive_id_type: receiveIdType },
+    data: {
+      receive_id: receiveId,
+      content,
+      msg_type: "media",
+    },
+  });
+  assertFeishuMessageApiSuccess(response, "Feishu video send failed");
+  return toFeishuSendResult(response, receiveId);
+}
+
 /**
  * Helper to detect file type from extension
  */
@@ -458,25 +544,48 @@ export async function sendMediaFeishu(params: {
   if (isImage) {
     const { imageKey } = await uploadImageFeishu({ cfg, image: buffer, accountId });
     return sendImageFeishu({ cfg, to, imageKey, replyToMessageId, replyInThread, accountId });
-  } else {
-    const fileType = detectFileType(name);
-    const { fileKey } = await uploadFileFeishu({
-      cfg,
-      file: buffer,
-      fileName: name,
-      fileType,
-      accountId,
-    });
-    // Feishu API: opus -> "audio", everything else (including video) -> "file"
-    const msgType = fileType === "opus" ? "audio" : "file";
-    return sendFileFeishu({
+  }
+
+  const fileType = detectFileType(name);
+  const { fileKey } = await uploadFileFeishu({
+    cfg,
+    file: buffer,
+    fileName: name,
+    fileType,
+    accountId,
+  });
+
+  if (fileType === "mp4") {
+    // Extract first frame as preview thumbnail (best-effort)
+    const thumbnail = await extractVideoFirstFrame(buffer);
+    let imageKey: string | undefined;
+    if (thumbnail) {
+      try {
+        const uploaded = await uploadImageFeishu({ cfg, image: thumbnail, accountId });
+        imageKey = uploaded.imageKey;
+      } catch {
+        // thumbnail upload failed — send video without preview
+      }
+    }
+    return sendVideoFeishu({
       cfg,
       to,
       fileKey,
-      msgType,
+      imageKey,
       replyToMessageId,
       replyInThread,
       accountId,
     });
   }
+
+  const msgType = fileType === "opus" ? "audio" : "file";
+  return sendFileFeishu({
+    cfg,
+    to,
+    fileKey,
+    msgType,
+    replyToMessageId,
+    replyInThread,
+    accountId,
+  });
 }
