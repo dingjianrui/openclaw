@@ -376,31 +376,42 @@ const execFileAsync = promisify(execFile);
  * Extract the first frame of a video buffer as a JPEG thumbnail.
  * Returns null if ffmpeg is not installed or extraction fails.
  */
+// Timeout/buffer limits for ffmpeg thumbnail extraction, matching src/media/ffmpeg-limits.ts
+const FFMPEG_THUMB_TIMEOUT_MS = 45_000;
+const FFMPEG_THUMB_MAX_BUFFER = 10 * 1024 * 1024;
+
 async function extractVideoFirstFrame(videoBuffer: Buffer): Promise<Buffer | null> {
   try {
-    return await withTempDownloadPath({ prefix: "openclaw-feishu-video-thumb" }, async (tmpDir) => {
-      const inputPath = `${tmpDir}.mp4`;
-      const outputPath = `${tmpDir}.jpg`;
-      try {
-        await fs.promises.writeFile(inputPath, videoBuffer);
-        await execFileAsync("ffmpeg", [
-          "-y",
-          "-i",
-          inputPath,
-          "-vframes",
-          "1",
-          "-f",
-          "image2",
-          "-vcodec",
-          "mjpeg",
-          outputPath,
-        ]);
-        return await fs.promises.readFile(outputPath);
-      } finally {
-        await fs.promises.unlink(inputPath).catch(() => {});
-        await fs.promises.unlink(outputPath).catch(() => {});
-      }
-    });
+    return await withTempDownloadPath(
+      { prefix: "openclaw-feishu-video-thumb" },
+      async (tmpPath) => {
+        const inputPath = `${tmpPath}.mp4`;
+        const outputPath = `${tmpPath}.jpg`;
+        try {
+          await fs.promises.writeFile(inputPath, videoBuffer);
+          await execFileAsync(
+            "ffmpeg",
+            [
+              "-y",
+              "-i",
+              inputPath,
+              "-vframes",
+              "1",
+              "-f",
+              "image2",
+              "-vcodec",
+              "mjpeg",
+              outputPath,
+            ],
+            { timeout: FFMPEG_THUMB_TIMEOUT_MS, maxBuffer: FFMPEG_THUMB_MAX_BUFFER },
+          );
+          return await fs.promises.readFile(outputPath);
+        } finally {
+          await fs.promises.unlink(inputPath).catch(() => {});
+          await fs.promises.unlink(outputPath).catch(() => {});
+        }
+      },
+    );
   } catch {
     return null;
   }

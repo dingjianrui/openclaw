@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,10 +11,16 @@ const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const loadWebMediaMock = vi.hoisted(() => vi.fn());
 
 const fileCreateMock = vi.hoisted(() => vi.fn());
+const imageCreateMock = vi.hoisted(() => vi.fn());
 const imageGetMock = vi.hoisted(() => vi.fn());
 const messageCreateMock = vi.hoisted(() => vi.fn());
 const messageResourceGetMock = vi.hoisted(() => vi.fn());
 const messageReplyMock = vi.hoisted(() => vi.fn());
+const execFileMock = vi.hoisted(() => vi.fn());
+
+vi.mock("child_process", () => ({
+  execFile: execFileMock,
+}));
 
 vi.mock("./client.js", () => ({
   createFeishuClient: createFeishuClientMock,
@@ -75,6 +82,7 @@ describe("sendMediaFeishu msg_type routing", () => {
           create: fileCreateMock,
         },
         image: {
+          create: imageCreateMock,
           get: imageGetMock,
         },
         message: {
@@ -90,6 +98,11 @@ describe("sendMediaFeishu msg_type routing", () => {
     fileCreateMock.mockResolvedValue({
       code: 0,
       data: { file_key: "file_key_1" },
+    });
+
+    imageCreateMock.mockResolvedValue({
+      code: 0,
+      image_key: "img_thumb_1",
     });
 
     messageCreateMock.mockResolvedValue({
@@ -109,11 +122,26 @@ describe("sendMediaFeishu msg_type routing", () => {
       contentType: "audio/ogg",
     });
 
+    // Mock ffmpeg to write a fake JPEG thumbnail to the output path.
+    // promisify(execFile)(cmd, args, opts) calls execFile(cmd, args, opts, callback)
+    // with the callback as the last argument.
+    execFileMock.mockImplementation((...mockArgs: unknown[]) => {
+      const args = mockArgs[1] as string[];
+      const callback = mockArgs[mockArgs.length - 1] as (
+        err: Error | null,
+        stdout: string,
+        stderr: string,
+      ) => void;
+      const outputPath = args[args.length - 1];
+      fsSync.writeFileSync(outputPath, Buffer.from("fake-jpeg"));
+      callback(null, "", "");
+    });
+
     imageGetMock.mockResolvedValue(Buffer.from("image-bytes"));
     messageResourceGetMock.mockResolvedValue(Buffer.from("resource-bytes"));
   });
 
-  it("uses msg_type=file for mp4", async () => {
+  it("uses msg_type=media for mp4 with thumbnail", async () => {
     await sendMediaFeishu({
       cfg: {} as any,
       to: "user:ou_target",
@@ -127,11 +155,14 @@ describe("sendMediaFeishu msg_type routing", () => {
       }),
     );
 
-    expect(messageCreateMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ msg_type: "file" }),
-      }),
-    );
+    // Thumbnail uploaded
+    expect(imageCreateMock).toHaveBeenCalled();
+
+    const sendCall = messageCreateMock.mock.calls[0][0];
+    expect(sendCall.data.msg_type).toBe("media");
+    const content = JSON.parse(sendCall.data.content);
+    expect(content.file_key).toBe("file_key_1");
+    expect(content.image_key).toBe("img_thumb_1");
   });
 
   it("uses msg_type=audio for opus", async () => {
@@ -176,7 +207,7 @@ describe("sendMediaFeishu msg_type routing", () => {
     );
   });
 
-  it("uses msg_type=file when replying with mp4", async () => {
+  it("uses msg_type=media when replying with mp4", async () => {
     await sendMediaFeishu({
       cfg: {} as any,
       to: "user:ou_target",
@@ -188,7 +219,7 @@ describe("sendMediaFeishu msg_type routing", () => {
     expect(messageReplyMock).toHaveBeenCalledWith(
       expect.objectContaining({
         path: { message_id: "om_parent" },
-        data: expect.objectContaining({ msg_type: "file" }),
+        data: expect.objectContaining({ msg_type: "media" }),
       }),
     );
 
@@ -208,7 +239,7 @@ describe("sendMediaFeishu msg_type routing", () => {
     expect(messageReplyMock).toHaveBeenCalledWith(
       expect.objectContaining({
         path: { message_id: "om_parent" },
-        data: expect.objectContaining({ msg_type: "file", reply_in_thread: true }),
+        data: expect.objectContaining({ msg_type: "media", reply_in_thread: true }),
       }),
     );
   });
@@ -225,6 +256,50 @@ describe("sendMediaFeishu msg_type routing", () => {
 
     const callData = messageReplyMock.mock.calls[0][0].data;
     expect(callData).not.toHaveProperty("reply_in_thread");
+  });
+
+  it("sends video without preview when ffmpeg fails", async () => {
+    execFileMock.mockImplementation((...mockArgs: unknown[]) => {
+      const callback = mockArgs[mockArgs.length - 1] as (
+        err: Error | null,
+        stdout: string,
+        stderr: string,
+      ) => void;
+      callback(new Error("ffmpeg not found"), "", "");
+    });
+
+    await sendMediaFeishu({
+      cfg: {} as any,
+      to: "user:ou_target",
+      mediaBuffer: Buffer.from("video"),
+      fileName: "clip.mp4",
+    });
+
+    // Thumbnail upload should not have been attempted
+    expect(imageCreateMock).not.toHaveBeenCalled();
+
+    const sendCall = messageCreateMock.mock.calls[0][0];
+    expect(sendCall.data.msg_type).toBe("media");
+    const content = JSON.parse(sendCall.data.content);
+    expect(content.file_key).toBe("file_key_1");
+    expect(content).not.toHaveProperty("image_key");
+  });
+
+  it("sends video without preview when thumbnail upload fails", async () => {
+    imageCreateMock.mockRejectedValueOnce(new Error("upload failed"));
+
+    await sendMediaFeishu({
+      cfg: {} as any,
+      to: "user:ou_target",
+      mediaBuffer: Buffer.from("video"),
+      fileName: "clip.mp4",
+    });
+
+    const sendCall = messageCreateMock.mock.calls[0][0];
+    expect(sendCall.data.msg_type).toBe("media");
+    const content = JSON.parse(sendCall.data.content);
+    expect(content.file_key).toBe("file_key_1");
+    expect(content).not.toHaveProperty("image_key");
   });
 
   it("passes mediaLocalRoots as localRoots to loadWebMedia for local paths (#27884)", async () => {
